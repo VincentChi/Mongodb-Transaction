@@ -8,19 +8,28 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import org.bson.types.ObjectId;
 import org.mongodb.morphia.annotations.Entity;
-import org.mongodb.transaction.DAOFramework;
+import org.mongodb.morphia.mapping.Mapper;
 import org.mongodb.transaction.TransactionalDAO;
 import org.mongodb.transaction.entity.LongBasedEntity;
 
 import com.mongodb.BasicDBObject;
+import com.mongodb.CommandResult;
+import com.mongodb.DB;
+import com.mongodb.DBCollection;
 import com.mongodb.DBCursor;
 import com.mongodb.DBObject;
 import com.mongodb.MongoClient;
 import com.mongodb.QueryBuilder;
 import com.mongodb.WriteResult;
 
-public class DBLock {
+/**
+ * The lock used in each single DB
+ * @author Vincent Chi
+ *
+ */
+public class Lock {
 	public static final String FIELD_ID = "_id";
 	public static final String FIELD_LOCK_TIME = "_lockTime";
 	public static final String FIELD_TRANSACTION_ID = "_transactionId";
@@ -34,45 +43,70 @@ public class DBLock {
 	public static final String ROLL_BACK_FIELD_TID = "transactionId";
 	public static final String ROLL_BACK_FIELD_IS_INSERT = "isInsert";
 
+	public static final boolean RETRY_LOCK = true;
+	public static final boolean DELETE_OLD_BEFORE_ROLLBACK = true;
+	public static final int DEFAULT_LOCK_EXPIRED_TIME = 10*1000;
+	
 	private static final DBObject DB_SELECT_ID = new BasicDBObject(FIELD_ID, 1);
 	
-	private MongoClient mongoClient;
-	private String dbName;
-	
-	private static TransactionalDAO<TransactionBackupEntity, Long> backupDao;
-
-	private static final boolean retryLock = true;
-	private static final boolean deleteOldBeforeRollback = true;
-	private static final int DEFAULT_LOCK_EXPIRED_TIME = 10*1000;
 	private static final int minRetryLockInterval = 100;
+	
+	private DB db;
+	private DBCollection backupCol;
+	//private static TransactionalDAO<TransactionBackupEntity, Long> backupDao;
+
 	private long lockExpiredTime = DEFAULT_LOCK_EXPIRED_TIME;
 
-	private String transactionId;
+	private ObjectId transactionId;
 	private boolean rollbackable;
 	private boolean commited;
 	private long    firstLockTime = 0;
 	
-	private Map<TransactionalDAO, List<DBObject>> daoQueriesMap = new HashMap<TransactionalDAO, List<DBObject>>();
-	private Map<TransactionalDAO, Set<Object>> daoBackupIdsMap = new HashMap<TransactionalDAO, Set<Object>>();
+	private Map<String, List<DBObject>> daoQueriesMap = new HashMap<String, List<DBObject>>();
+	private Map<String, Set<Object>> daoBackupIdsMap = new HashMap<String, Set<Object>>();
 
 	private DBObject lockUnsetObject;
 	
 	// In debug mode, the lock will never expire and never throw RetryLockTimeOut exception
 	private boolean debugMode = false;
 
-	public DBLock(MongoClient mongoClient, String dbName) {
+	public Lock(DB db, boolean rollbackable) {
+		this(db, rollbackable, DEFAULT_LOCK_EXPIRED_TIME);
+	}
+	
+	public Lock(DB db, boolean rollbackable, long lockExpiredTime) {
+		this.db = db;
+		this.transactionId = ObjectId.get();
+		this.rollbackable = rollbackable;
+		this.lockExpiredTime = lockExpiredTime;
+		
+		this.backupCol = db.getCollection(ROLL_BACK_COLLECTION_NAME);
+		//this.backupDao = TransactionalDAO.getInstance(TransactionBackupEntity.class, (MongoClient)db.getMongo(), db.getName());
+
+		DBObject unsetFields = new BasicDBObject();
+		unsetFields.put(FIELD_LOCK_TIME, 1);
+		unsetFields.put(FIELD_TRANSACTION_ID, 1);
+		this.lockUnsetObject = new BasicDBObject(TransactionalDAO.$unset,
+				unsetFields);
+	}
+	
+	@Deprecated
+	public Lock(MongoClient mongoClient, String dbName) {
 		this(mongoClient, dbName, false);
 	}
 
-	public DBLock(MongoClient mongoClient, String dbName, boolean rollbackable) {
+	@Deprecated
+	public Lock(MongoClient mongoClient, String dbName, boolean rollbackable) {
 		this(mongoClient, dbName, rollbackable, DEFAULT_LOCK_EXPIRED_TIME);
 	}
 
-	public DBLock(MongoClient mongoClient, String dbName, boolean rollbackable, long expiredTime) {
-		this.transactionId = generateTransactionId();
+	@Deprecated
+	public Lock(MongoClient mongoClient, String dbName, boolean rollbackable, long expiredTime) {
+		this.transactionId = ObjectId.get();
 		this.rollbackable = rollbackable;
 		this.lockExpiredTime = expiredTime > DEFAULT_LOCK_EXPIRED_TIME ? expiredTime : DEFAULT_LOCK_EXPIRED_TIME;
-		this.backupDao = TransactionalDAO.getInstance(TransactionBackupEntity.class, mongoClient, dbName);
+		//this.backupDao = TransactionalDAO.getInstance(TransactionBackupEntity.class, mongoClient, dbName);
+		backupCol = mongoClient.getDB(dbName).getCollection(ROLL_BACK_COLLECTION_NAME);
 
 		DBObject unsetFields = new BasicDBObject();
 		unsetFields.put(FIELD_LOCK_TIME, 1);
@@ -81,22 +115,22 @@ public class DBLock {
 				unsetFields);
 	}
 
-	public void lock(TransactionalDAO dao, Collection<Object> ids)
+	public void lock(DBCollection col, Collection<Object> ids)
 			throws DBLockException {
 		DBObject query = new BasicDBObject(FIELD_ID, new BasicDBObject(
 				TransactionalDAO.$in, ids));
-		lock(dao, query);
+		lock(col, query);
 	}
 
-	public void lock(TransactionalDAO dao, Object id) throws DBLockException {
-		lock(dao, new BasicDBObject(FIELD_ID, id));
+	public void lock(DBCollection col, Object id) throws DBLockException {
+		lock(col, new BasicDBObject(FIELD_ID, id));
 	}
-	
-	public void lockInsert(TransactionalDAO dao, Object id) throws DBLockException {
-		Set<Object> backupIds = daoBackupIdsMap.get(dao);
+    
+	public void lockInsert(DBCollection col, Object id) throws DBLockException {
+		Set<Object> backupIds = daoBackupIdsMap.get(col.getName());
 		if(backupIds==null) {
 			backupIds=new HashSet<Object>();
-			daoBackupIdsMap.put(dao, backupIds);
+			daoBackupIdsMap.put(col.getName(), backupIds);
 		}
 		if(id!=null) {
 			if (!backupIds.contains(id)) {
@@ -104,21 +138,21 @@ public class DBLock {
 				//dest.put(ROLL_BACK_FIELD_ID, DAOUtils.generateLongID(backupDao));
 				//dest.put(ROLL_BACK_FIELD_DATA, record);
 				dest.put(ROLL_BACK_FIELD_DATA_ID, id);
-				dest.put(ROLL_BACK_FIELD_COLLECTION, dao.getCollection().getName());
+				dest.put(ROLL_BACK_FIELD_COLLECTION, col.getName());
 				dest.put(ROLL_BACK_FIELD_TID, transactionId);
 				dest.put(ROLL_BACK_FIELD_IS_INSERT, true);
 				// ROLL_BACK_FIELD_ROLLBACKED //TODO rollback status
-				backupDao.getCollection().save(dest);
+				backupCol.save(dest);
 				backupIds.add(id);
 			}
 		}
 	}
 
-	public void lock(TransactionalDAO dao, DBObject query) throws DBLockException {
-		if (lock(dao, query, false)) {
-			backupRecord(dao, query);
+	public void lock(DBCollection col, DBObject query) throws DBLockException {
+		if (lock(col, query, false)) {
+			backupRecord(col, query);
 		} else {
-			if (retryLock) {
+			if (RETRY_LOCK) {
 				retryLock();
 			} else {
 				rollback();
@@ -127,15 +161,15 @@ public class DBLock {
 		}
 	}
 
-	private boolean lock(TransactionalDAO dao, DBObject query, boolean relock) {
-		long count = dao.getCollection().getCount(query);
+	private boolean lock(DBCollection col, DBObject query, boolean relock) {
+		long count = col.getCount(query);
 		long currentTime = currentTimeMillis();
 
-        if (!daoQueriesMap.containsKey(dao)) {
-            daoQueriesMap.put(dao, new ArrayList<DBObject>());
+        if (!daoQueriesMap.containsKey(col.getName())) {
+            daoQueriesMap.put(col.getName(), new ArrayList<DBObject>());
         }
         if (!relock) {
-            List<DBObject> dbObjects = dao.getCollection().find(query, DB_SELECT_ID).toArray();
+            List<DBObject> dbObjects = col.find(query, DB_SELECT_ID).toArray();
             List<Object> existsIds = new ArrayList<Object>(dbObjects.size());
             for (DBObject dbObject : dbObjects) {
                 existsIds.add(dbObject.get(FIELD_ID));
@@ -144,7 +178,7 @@ public class DBLock {
             DBObject newQuery = new BasicDBObject(FIELD_ID, new BasicDBObject(
                     TransactionalDAO.$in, existsIds));
 
-            daoQueriesMap.get(dao).add(newQuery);
+            daoQueriesMap.get(col.getName()).add(newQuery);
         }
 
 		DBObject updateQuery = new BasicDBObject();
@@ -161,7 +195,7 @@ public class DBLock {
 		update.put(FIELD_TRANSACTION_ID, transactionId);
 		DBObject updateSet = new BasicDBObject(TransactionalDAO.$set, update);
 
-		WriteResult result = dao.getCollection().updateMulti(updateQuery, updateSet);
+		WriteResult result = col.updateMulti(updateQuery, updateSet);
 		if (result.getN() < count) {
 			return false;
         } else {
@@ -169,17 +203,17 @@ public class DBLock {
         }
 	}
 
-	private void backupRecord(TransactionalDAO dao, DBObject query)
+	private void backupRecord(DBCollection col, DBObject query)
 			throws DBLockException {
-		if (!rollbackable || ROLL_BACK_COLLECTION_NAME.equals(dao.getCollection().getName()))
+		if (!rollbackable || ROLL_BACK_COLLECTION_NAME.equals(col.getName()))
 			return;
 
-		if (!daoBackupIdsMap.containsKey(dao)) {
-			daoBackupIdsMap.put(dao, new HashSet<Object>());
+		if (!daoBackupIdsMap.containsKey(col.getName())) {
+			daoBackupIdsMap.put(col.getName(), new HashSet<Object>());
 		}
-		Set<Object> backupIds = daoBackupIdsMap.get(dao);
+		Set<Object> backupIds = daoBackupIdsMap.get(col.getName());
 
-		DBCursor cursor = dao.getCollection().find(query);
+		DBCursor cursor = col.find(query);
 		/*if(!cursor.hasNext()) {// Insert new object
 			Object id = query.get(FIELD_ID);
 			if(id!=null) {
@@ -211,11 +245,11 @@ public class DBLock {
 			//dest.put(ROLL_BACK_FIELD_ID, DAOUtils.generateLongID(backupDao));
 			dest.put(ROLL_BACK_FIELD_DATA, record);
 			dest.put(ROLL_BACK_FIELD_DATA_ID, id);
-			dest.put(ROLL_BACK_FIELD_COLLECTION, dao.getCollection().getName());
+			dest.put(ROLL_BACK_FIELD_COLLECTION, col.getName());
 			dest.put(ROLL_BACK_FIELD_TID, transactionId);
 			dest.put(ROLL_BACK_FIELD_IS_INSERT, false);
 			// ROLL_BACK_FIELD_ROLLBACKED //TODO rollback status
-			backupDao.getCollection().save(dest);
+			backupCol.save(dest);
 			backupIds.add(id);
 		}
 	}
@@ -239,14 +273,14 @@ public class DBLock {
 	}
 
 	public void unlock() {
-		for (TransactionalDAO dao : daoQueriesMap.keySet()) {
-			List<DBObject> queries = daoQueriesMap.get(dao);
+		for (String colName : daoQueriesMap.keySet()) {
+			List<DBObject> queries = daoQueriesMap.get(colName);
 			for (DBObject query : queries) {
 				DBObject unsetQuery = new BasicDBObject();
 				unsetQuery.putAll(query);
 				unsetQuery.put(FIELD_TRANSACTION_ID, transactionId);
 
-				dao.getCollection().updateMulti(unsetQuery, lockUnsetObject);
+				db.getCollection(colName).updateMulti(unsetQuery, lockUnsetObject);
 			}
 		}
 		clearBackups();
@@ -257,21 +291,21 @@ public class DBLock {
 			return;
 		}
 
-		for (TransactionalDAO dao : daoBackupIdsMap.keySet()) {
-			//Set<Object> ids = daoBackupIdsMap.get(dao);
+		for (String colName : daoBackupIdsMap.keySet()) {
+			DBCollection col = db.getCollection(colName);
             DBObject backupQuery = QueryBuilder.start(ROLL_BACK_FIELD_TID).is(transactionId)
-                    .and(ROLL_BACK_FIELD_COLLECTION).is(dao.getCollection().getName()).get();
-			DBCursor backups = backupDao.getCollection().find(backupQuery);
+                    .and(ROLL_BACK_FIELD_COLLECTION).is(colName).get();
+			DBCursor backups = backupCol.find(backupQuery);
 			while (backups.hasNext()) {
 				DBObject rollback = backups.next();
 				Boolean isInsert = (Boolean) rollback.get(ROLL_BACK_FIELD_IS_INSERT);
 				isInsert = (isInsert==null)?false:isInsert;
-				if(deleteOldBeforeRollback||isInsert) {
-				    dao.getCollection().remove(new BasicDBObject(FIELD_ID, rollback.get(ROLL_BACK_FIELD_DATA_ID)));
+				if(DELETE_OLD_BEFORE_ROLLBACK||isInsert) {
+				    col.remove(new BasicDBObject(FIELD_ID, rollback.get(ROLL_BACK_FIELD_DATA_ID)));
 				}
 				
 				if(!isInsert) {
-					dao.getCollection().save((DBObject)rollback.get(ROLL_BACK_FIELD_DATA)); //A dao.save() must not be override
+					col.save((DBObject)rollback.get(ROLL_BACK_FIELD_DATA)); //A dao.save() must not be override
 				}
 			}
 		}
@@ -294,10 +328,11 @@ public class DBLock {
 	}
 
 	private boolean relock() {
-		for (TransactionalDAO dao : daoQueriesMap.keySet()) {
-			List<DBObject> queries = daoQueriesMap.get(dao);
+		for (String colName : daoQueriesMap.keySet()) {
+			DBCollection col = db.getCollection(colName);
+			List<DBObject> queries = daoQueriesMap.get(colName);
 			for (DBObject query : queries) {
-				if (!lock(dao, query, true)) {
+				if (!lock(col, query, true)) {
 					return false;
 				}
 			}
@@ -306,7 +341,7 @@ public class DBLock {
 	}
 
 	private long currentTimeMillis() {
-		long currentTimeMillis = ((Double) backupDao.getCollection().getDB()
+		long currentTimeMillis = ((Double) backupCol.getDB()
 				.eval("new Date().getTime()")).longValue();
 		
 		//TODO comment 'checkTimeout' for DEBUG
@@ -325,11 +360,14 @@ public class DBLock {
 	private void clearBackups() {
 		if (rollbackable) {
 			DBObject clearObject = new BasicDBObject(ROLL_BACK_FIELD_TID, transactionId);
-			backupDao.getCollection().remove(clearObject);
+			backupCol.remove(clearObject);
 		}
 	}
+}
+
+@Deprecated
+@SuppressWarnings("serial")
+@Entity(value=Lock.ROLL_BACK_COLLECTION_NAME, noClassnameStored=true)
+class TransactionBackupEntity extends LongBasedEntity{
 	
-    private String generateTransactionId() {
-        return Thread.currentThread().getName()+"_"+System.currentTimeMillis() + "_" + (int) ( Math.random() * 1000 );
-    }
 }

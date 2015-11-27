@@ -17,6 +17,7 @@ import org.mongodb.morphia.dao.BasicDAO;
 import org.mongodb.morphia.mapping.MappedClass;
 import org.mongodb.morphia.mapping.MappedField;
 import org.mongodb.morphia.mapping.Mapper;
+import org.mongodb.morphia.query.Query;
 import org.mongodb.transaction.lock.DBLock;
 import org.mongodb.transaction.lock.DBLockException;
 import org.mongodb.transaction.lock.DBLockManager;
@@ -381,9 +382,27 @@ public class TransactionalDAO<T, K> extends BasicDAO<T, K> {
         }
     }
 
+    @Override
+    public WriteResult delete(final T entity) {
+        lockQuery(getEntityId(entity));
+        return super.delete(entity);
+    }
+    
+    @Override
+    public WriteResult delete(final T entity, final WriteConcern wc) {
+        lockQuery(getEntityId(entity));
+        return super.delete(entity, wc);
+    }
+    
     public WriteResult deleteById(K id) {
     	lockQuery(id);
         return super.deleteById(id);
+    }
+    
+    @Override
+    public WriteResult deleteByQuery(final Query<T> query) {
+        lockQuery(query.getQueryObject());
+        return super.deleteByQuery(query);
     }
 
     public DBObject findAndModify(DBObject query, DBObject fields,
@@ -469,10 +488,7 @@ public class TransactionalDAO<T, K> extends BasicDAO<T, K> {
     
     @Override
     public Key<T> save(T entityToSave) {
-    	Mapper mp = getMorphia().getMapper();
-        MappedClass mappedClass = mp.getMappedClass(entityToSave);
-
-        K idValue = (K) mp.getId(entityToSave);
+        K idValue = getEntityId(entityToSave);
         if(idValue!=null) {
         	lockQuery(idValue);
         	lockInsert(idValue);
@@ -483,6 +499,13 @@ public class TransactionalDAO<T, K> extends BasicDAO<T, K> {
         	lockInsert(idValue);
         	return result;
         }
+    }
+    
+    private K getEntityId(T entity) {
+        Mapper mp = getMorphia().getMapper();
+        MappedClass mappedClass = mp.getMappedClass(entity);
+        K id = (K) mp.getId(entity);
+        return id;
     }
 
     private void lockQuery(DBObject query) throws DBLockException {
