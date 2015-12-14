@@ -10,27 +10,23 @@ import java.util.Map;
 import java.util.Set;
 
 import org.mongodb.morphia.Datastore;
-import org.mongodb.morphia.Key;
+import org.mongodb.morphia.DatastoreImpl;
 import org.mongodb.morphia.Morphia;
 import org.mongodb.morphia.annotations.Version;
 import org.mongodb.morphia.dao.BasicDAO;
 import org.mongodb.morphia.mapping.MappedClass;
 import org.mongodb.morphia.mapping.MappedField;
 import org.mongodb.morphia.mapping.Mapper;
-import org.mongodb.morphia.query.Query;
 import org.mongodb.transaction.lock.DBLock;
-import org.mongodb.transaction.lock.DBLockException;
-import org.mongodb.transaction.lock.DBLockManager;
 import org.mongodb.transaction.util.CollectionDelegate;
 
 import com.mongodb.BasicDBObject;
 import com.mongodb.BasicDBObjectBuilder;
-import com.mongodb.CommandResult;
+import com.mongodb.DBCollection;
 import com.mongodb.DBObject;
 import com.mongodb.MongoClient;
 import com.mongodb.MongoException;
-import com.mongodb.WriteConcern;
-import com.mongodb.WriteResult;
+import com.mongodb.TransactionalMongoClient;
 
 /**
  * Wraps Morphia's BasicDAO class to simplify creation of instances and grant that only single
@@ -97,26 +93,20 @@ public class TransactionalDAO<T, K> extends BasicDAO<T, K> {
             Collections.<Class, TransactionalDAO>synchronizedMap(new HashMap<Class, TransactionalDAO>());
 
     private final static ThreadLocal<DBLock> locks = new ThreadLocal<DBLock>();
-    private static MongoClient transactionClient;
-    private static String transactionDbName;
 
     private static Morphia _morphia = new Morphia();
-    private Datastore dataStore;
     private Set<String> fieldsName;
 
     public TransactionalDAO(Class<T> entityClass,
                             MongoClient mongoClient, String dbName) {
-	    this(entityClass, _morphia.createDatastore(mongoClient, dbName));
+	    this(entityClass, _morphia.createDatastore(Transaction.transactinal(mongoClient), dbName));
     }
     
     public TransactionalDAO(Class<T> entityClass,
                             Datastore ds) {
-	    super(entityClass, ds);
-	    this.dataStore = ds;
-	    if(transactionClient==null) {
-	    	transactionClient=ds.getMongo();
-	    	transactionDbName=ds.getDB().getName();
-	    }
+	    super(entityClass, (ds.getMongo() instanceof TransactionalMongoClient)?ds:
+	    	 (_morphia.createDatastore(Transaction.transactinal(ds.getMongo()), ds.getDB().getName())));
+	    
 	    Set<String> fieldsName = new HashSet<String>();
         for (MappedField mappedField : DAOFramework.getInstance().getMorphia().getMapper().getMappedClass(entityClass).getPersistenceFields()) {
             fieldsName.add(mappedField.getNameToStore());
@@ -255,7 +245,7 @@ public class TransactionalDAO<T, K> extends BasicDAO<T, K> {
 
         T result;
         if (versionFields.isEmpty()) {//no optimistic-locking version control
-            DBObject resultMongo = findAndModify(
+            DBObject resultMongo = this.getCollection().findAndModify(
                     query, null, null, false/*remove*/, new BasicDBObject("$set", setFields), true, false);
             if (resultMongo == null)
                 throw new MongoException(NO_SUCH_ENTITY);
@@ -267,7 +257,7 @@ public class TransactionalDAO<T, K> extends BasicDAO<T, K> {
             long newVersion = nextValue(oldVersion);
             setFields.put(versionKeyName, newVersion); //assign new ol-version
             query.put(mfVersion.getNameToStore(), oldVersion); //add ol-version as a search criteria
-            DBObject resultMongo = findAndModify(
+            DBObject resultMongo = this.getCollection().findAndModify(
                     query, null, null, false/*remove*/, new BasicDBObject("$set", setFields), true, false);
             if (resultMongo == null) {
                 if (exists(Mapper.ID_KEY, idValue))
@@ -313,180 +303,8 @@ public class TransactionalDAO<T, K> extends BasicDAO<T, K> {
         }
         return query;
     }
-
-    /**
-     * Lock all DB records used in current thread. <br>
-     * The locked data is rollbackable as default. Call {@link #rollback()} if
-     * needed.
-     */
-    public static void lock() {
-        lock(true);
-    }
-
-    /**
-     * Lock all DB records used in current thread for a while. <br>
-     * The locked data is rollbackable as default. Call {@link #rollback()} if
-     * needed.
-     */
-    public static void lock(long lockTime) {
-    	DBLock lock = DBLockManager.getLock(transactionClient, transactionDbName, true, lockTime);
-    	locks.set(lock);
-    }
-
-    /**
-     * Lock all DB records used in current thread. <br>
-     * If rollbackable is true, call {@link #rollback()} when needed.<br>
-     * If deleteOldBeforeRollback is true, would delete old values then rollback
-     * 
-     * @param rollbackable
-     * @param deleteOldBeforeRollback
-     */
-    public static void lock(boolean rollbackable) {
-        DBLock lock = DBLockManager.getLock(transactionClient, transactionDbName, rollbackable);
-        locks.set(lock);
-    }
-
-    /*
-     * TODO If no commit, rollback
-     */
-    @Deprecated
-    public static void commit() {
-        unlock();
-    }
     
-    /**
-     * Unlock locked data when operation finished. 
-     * This method must be called after transaction finished, or the lock would not be removed and be used by other service
-     * 
-     */
-    public static void unlock() {
-        DBLock lock = locks.get();
-
-        if (lock != null) {
-            lock.unlock();
-            locks.remove();
-        }
-    }
-
-    /**
-     * Rollback transaction to the time before {@link #lock()}.<br> 
-     * Could be called when exception caught or other conditions. 
-     * @throws DBLockException
-     */
-    public static void rollback() {
-        DBLock lock = locks.get();
-
-        if (lock != null) {
-            lock.rollback();
-            locks.remove();
-        }
-    }
-
-    @Override
-    public WriteResult delete(final T entity) {
-        lockQuery(getEntityId(entity));
-        return super.delete(entity);
-    }
-    
-    @Override
-    public WriteResult delete(final T entity, final WriteConcern wc) {
-        lockQuery(getEntityId(entity));
-        return super.delete(entity, wc);
-    }
-    
-    public WriteResult deleteById(K id) {
-    	lockQuery(id);
-        return super.deleteById(id);
-    }
-    
-    @Override
-    public WriteResult deleteByQuery(final Query<T> query) {
-        lockQuery(query.getQueryObject());
-        return super.deleteByQuery(query);
-    }
-
-    public DBObject findAndModify(DBObject query, DBObject fields,
-            DBObject sort, boolean remove, DBObject update, boolean returnNew,
-            boolean upsert) {
-    	lockQuery(query);
-    	
-    	// To make sure the return fields must contains id
-		if (fields != null && !fields.keySet().isEmpty() && !fields.containsField(Mapper.ID_KEY)) {
-    		fields.put(Mapper.ID_KEY, 1);
-    	}
-    	DBObject result = this.getCollection().findAndModify(query, fields, sort, remove,
-                update, returnNew, upsert);
-    	if(upsert){
-    	    lockInsert((K) result.get(Mapper.ID_KEY));// single id
-    	}
-    	return result;
-    }
-
-    public WriteResult update(DBObject q, DBObject o, boolean upsert,
-            boolean multi) {
-    	lockQuery(q);
-    	
-    	WriteResult result = this.getCollection().update(q, o, upsert, multi);
-    	if(upsert){
-    		lockInsert(q,result);
-    	}
-    	return result;
-    }
-
-    public WriteResult update(DBObject q, DBObject o, boolean upsert,
-            boolean multi, WriteConcern concern) {
-    	lockQuery(q);
-    	
-    	WriteResult result = this.getCollection().update(q, o, upsert, multi, concern);
-    	if(upsert){
-    		lockInsert(q,result);
-    	}
-    	return result;
-    }
-
-    public WriteResult updateMulti(DBObject q, DBObject o) {
-    	lockQuery(q);
-        return this.getCollection().updateMulti(q, o);
-    }
-
-    public WriteResult update(DBObject q, DBObject o) {
-    	lockQuery(q);
-        return this.getCollection().update(q, o);
-    }
-
-    public DBObject findAndModify(DBObject query, DBObject update) {
-    	lockQuery(query);
-        return this.getCollection().findAndModify(query, update);
-    }
-
-    public WriteResult save(DBObject jo) {
-    	lockQuery(jo);
-        return this.getCollection().save(jo);
-    }
-
-    public WriteResult remove(DBObject o) {
-    	lockQuery(o);
-        return this.getCollection().remove(o);
-    }
-    
-    public WriteResult remove(DBObject o, WriteConcern concern) {
-        lockQuery(o);
-        return this.getCollection().remove(o,concern);
-    }
-    
-    public WriteResult insert(DBObject o) {
-        WriteResult result=this.getCollection().insert(o);
-        lockInsert(o,result);
-        return result;
-    }
-    
-    public WriteResult insert(DBObject o, WriteConcern concern) {
-        WriteResult result=this.getCollection().insert(o,concern);
-        lockInsert(o,result);
-        return result;
-    }
-    
-    @Override
+    /*@Override
     public Key<T> save(T entityToSave) {
         K idValue = getEntityId(entityToSave);
         if(idValue!=null) {
@@ -508,50 +326,18 @@ public class TransactionalDAO<T, K> extends BasicDAO<T, K> {
         return id;
     }
 
-    private void lockQuery(DBObject query) throws DBLockException {
-        DBLock lock = locks.get();
-        if (lock != null) {
-            lock.lock(this, query);
-        }
-    }
-
     private void lockQuery(K id) throws DBLockException {
         DBLock lock = locks.get();
         if (lock != null) {
             lock.lock(this, id);
         }
     }
-    
-    private void lockInsert(DBObject q, WriteResult result) {
-    	if(result==null) return;
-    	CommandResult lastError = result.getLastError();
-    	if(q.containsField(Mapper.ID_KEY)) {// If inserted, the DBObject id will be auto generated if not manually set
-    		Object id = q.containsField(Mapper.ID_KEY);
-    		if(id instanceof DBObject) {
-    			if(!id.toString().contains($)) { // TODO This could not happen, because such $eq/$in would be locked in query part
-    				if(lastError.getException()==null) {// If the writeConcern is unacknowledge/none, will get an exception such like duplicate key
-    					lockInsert((K) q.get(Mapper.ID_KEY));
-    				}
-    			}
-    		} else {
-    			if(lastError.getException()==null) {
-					lockInsert((K) q.get(Mapper.ID_KEY));
-				}
-    		}
-		} else {// update with upsert=true
-			if (lastError.ok() || lastError.getErrorMessage().equals( "No matching object found" )) {
-    			Object id = lastError.get( "upserted" );// if lastError.getException() is "duplicated key", id==null
-    			if(id!=null) {
-    				lockInsert((K) id);// single id
-    			}
-            }
-		}
-    }
+
     
     private void lockInsert(K id) throws DBLockException {
         DBLock lock = locks.get();
         if (lock != null) {
             lock.lockInsert(this, id);
         }
-    }
+    }*/
 }

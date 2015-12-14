@@ -1,5 +1,6 @@
 package org.mongodb.transaction;
 
+import java.net.UnknownHostException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
@@ -8,14 +9,17 @@ import org.mongodb.transaction.lock.Locker;
 import org.mongodb.transaction.lock.LockerManager;
 
 import com.mongodb.DB;
-import com.mongodb.DBApiLayer;
 import com.mongodb.DBCollection;
+import com.mongodb.Mongo;
+import com.mongodb.MongoClient;
 import com.mongodb.TransactionalDBCollection;
+import com.mongodb.TransactionalMongoClient;
 
 @SuppressWarnings("deprecation")
 public class Transaction
 {
-	private final static ConcurrentMap<DB,ConcurrentMap<String,TransactionalDBCollection>> _dbs = new ConcurrentHashMap<DB,ConcurrentMap<String,TransactionalDBCollection>>();
+	private final static ConcurrentMap<DB,ConcurrentMap<String,TransactionalDBCollection>> _dbCols = new ConcurrentHashMap<DB,ConcurrentMap<String,TransactionalDBCollection>>();
+	private final static ConcurrentMap<Mongo,TransactionalMongoClient> _mongos = new ConcurrentHashMap<Mongo,TransactionalMongoClient>();
 	private final static ThreadLocal<Locker> lockers = new ThreadLocal<Locker>();
 	
 	public static TransactionalDBCollection transactinal(DBCollection dbCollection, IApplyHandler handler)
@@ -27,19 +31,41 @@ public class Transaction
 	
 	public static TransactionalDBCollection transactinal(DBCollection dbCollection)
 	{
-		ConcurrentMap<String,TransactionalDBCollection> _collections = _dbs.get(dbCollection.getDB().getName());
+		ConcurrentMap<String,TransactionalDBCollection> _collections = _dbCols.get(dbCollection.getDB().getName());
 		if(_collections !=null) {
 			TransactionalDBCollection c = _collections.get(dbCollection.getName());
 	        if ( c != null )
 	            return c;
 		} else {
 			_collections = new ConcurrentHashMap<String,TransactionalDBCollection>();
-			_dbs.putIfAbsent(dbCollection.getDB(), _collections);
+			_dbCols.putIfAbsent(dbCollection.getDB(), _collections);
 		}
 		
 		TransactionalDBCollection c = new TransactionalDBCollection(dbCollection);
-		TransactionalDBCollection old = _dbs.get(dbCollection.getDB()).putIfAbsent(dbCollection.getName(), c);
+		TransactionalDBCollection old = _dbCols.get(dbCollection.getDB()).putIfAbsent(dbCollection.getName(), c);
 		return old != null ? old : c;
+	}
+	
+	public static MongoClient transactinal(MongoClient mongo)
+	{
+		TransactionalMongoClient tMongo= _mongos.get(mongo);
+		if(tMongo==null) {
+			try
+            {
+				if(TransactionalMongoClient.isDirect(mongo)) {
+					tMongo = new TransactionalMongoClient(mongo.getAddress(), mongo.getCredentialsList(), mongo.getMongoClientOptions());
+				} else {
+					tMongo = new TransactionalMongoClient(mongo.getAllAddress(), mongo.getCredentialsList(), mongo.getMongoClientOptions());
+				}
+            }
+            catch (UnknownHostException e)
+            {
+                // TODO Auto-generated catch block
+            }
+			
+			_mongos.put(mongo, tMongo);
+		}
+		return tMongo;
 	}
 	
 	/**

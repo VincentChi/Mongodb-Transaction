@@ -18,8 +18,8 @@ public class UserEntity
 
 	@Reference("school")
 	private SchoolEntity       school;
-//	@Embedded("school")
-//	private SchoolEntity       schoolDoc;
+	@Embedded("school")
+	private SchoolEntity       schoolDoc;
 	@Reference
 	private List<CourseEntity> courses;
 //	@Embedded

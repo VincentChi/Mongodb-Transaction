@@ -1,7 +1,9 @@
 package com.mongodb;
 
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
+import org.mongodb.morphia.mapping.Mapper;
 import org.mongodb.transaction.IApplyHandler;
 import org.mongodb.transaction.Transaction;
 import org.mongodb.transaction.lock.Locker;
@@ -38,6 +40,25 @@ public class TransactionalDBCollection extends DBCollectionImpl
 		return result;
 	}
 	
+	@Override
+	public DBObject findAndModify(final DBObject query, final DBObject fields, final DBObject sort,
+                                  final boolean remove, final DBObject update,
+                                  final boolean returnNew, final boolean upsert,
+                                  final long maxTime, final TimeUnit maxTimeUnit) {
+		getLocker().lock(col, query);// TODO not sure modify all or modify first
+
+		// To make sure the return fields must contains id
+		if (fields != null && !fields.keySet().isEmpty() && !fields.containsField(Mapper.ID_KEY))
+		{
+			fields.put(ID_FIELD_NAME, 1);
+		}
+		DBObject result = super.findAndModify(query, fields, sort, remove, update, returnNew, upsert, maxTime, maxTimeUnit);
+		if(upsert){
+			getLocker().lockInsert(col, result.get(ID_FIELD_NAME));// single id
+    	}
+		return result;
+	}
+    
 	/**
 	 * Lock new insert documents
 	 */

@@ -72,6 +72,6 @@ public class MongoTest
 	}
 	
 	public String getDbName() {
-		return "test";
+		return "trasactionTest";
 	}
 }
