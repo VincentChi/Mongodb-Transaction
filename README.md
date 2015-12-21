@@ -36,10 +36,12 @@ If we want to make your codes support transaction, we should follow these steps
  
 2) Use mongo java driver
 ```Java
-		DBCollection col=getCollection();
+		TransactionalMongoClient tClient = Transaction.transactional(mongoClient);
+		DBCollection col=tClient.getCollection("testCol");
+		// Another way to get transactional DBCollection
+		// col = Transaction.transactinal(protoCol);
 		
 		Transaction.start();
-		col = Transaction.transactinal(col);
 		col.update(new BasicDBObject("_id", "_id01"), new BasicDBObject("$set", new BasicDBObject("value", "value02")));
 		
 		DBCursor cursor = col.find(new BasicDBObject("_id", "_id01"));
@@ -50,4 +52,26 @@ If we want to make your codes support transaction, we should follow these steps
 		assertEquals(cursor.next().get("value"),"value01");
 		
 		Transaction.end();
+```
+
+3) Append custom fields each time editing the collection
+```Java
+		MongoClient tMongo = Transaction.transactinal(protoMongo, new IApplyHandler() {
+
+			@Override
+        	public void apply(DBObject obj)
+        	{
+				obj.put("_timestamp", new Date().getTime());
+			}
+
+		});
+		
+```
+
+4) Backup documents manually
+   (Invoke it after updating DB directly using JavaScript)
+```Java
+		TransactionalDBCollection tCol=(TransactionalDBCollection)conn;
+		tCol.backup("_id001","_id002");
+		tCol.backupInserted("_id001","_id002");
 ```

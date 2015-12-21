@@ -48,14 +48,19 @@ public class Transaction
 	
 	public static MongoClient transactinal(MongoClient mongo)
 	{
+		return transactinal(mongo, null);
+	}
+	
+	public static MongoClient transactinal(MongoClient mongo, IApplyHandler handler)
+	{
 		TransactionalMongoClient tMongo= _mongos.get(mongo);
 		if(tMongo==null) {
 			try
             {
 				if(TransactionalMongoClient.isDirect(mongo)) {
-					tMongo = new TransactionalMongoClient(mongo.getAddress(), mongo.getCredentialsList(), mongo.getMongoClientOptions());
+					tMongo = new TransactionalMongoClient(mongo.getAddress(), mongo.getCredentialsList(), mongo.getMongoClientOptions(), handler);
 				} else {
-					tMongo = new TransactionalMongoClient(mongo.getAllAddress(), mongo.getCredentialsList(), mongo.getMongoClientOptions());
+					tMongo = new TransactionalMongoClient(mongo.getAllAddress(), mongo.getCredentialsList(), mongo.getMongoClientOptions(), handler);
 				}
             }
             catch (UnknownHostException e)

@@ -1,5 +1,6 @@
 package com.mongodb;
 
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
@@ -78,6 +79,28 @@ public class TransactionalDBCollection extends DBCollectionImpl
 		this.applyHandler = applyHandler;
 	}
 
+	/**
+	 * This method could be invoked after update DB using other methods beyond the control of JAVA codes<br>
+	 * For example, invoke {@link DB#eval}) to modify data using a existed java script<br>
+	 * We must record all the documents manually, to make sure the records roll back correctly.
+	 * @param ids The documents ids
+	 */
+	public void backup(Object... ids) {
+		getLocker().lock(col, new BasicDBObject(ID_FIELD_NAME, new BasicDBObject("$in", ids)));
+	}
+	
+	/**
+	 * This method could be invoked after update DB using other methods beyond the control of JAVA codes<br>
+	 * For example, invoke {@link DB#eval}) to insert data using a existed java script<br>
+	 * We must record all the inserted documents manually, to make sure the records cleared after roll back
+	 * @param ids The new added documents ids
+	 */
+	public void backupInserted(Object... ids) {
+		for(Object id:ids) {
+			getLocker().lockInsert(col, id);
+		}
+	}
+	
 	@SuppressWarnings("deprecation")
     private void lockInsert(DBObject q, WriteResult result) {
     	if(result==null) return;
