@@ -14,7 +14,9 @@ Grab via maven
 ```
 
 **Usage**
+
 If we want to make your codes support transaction, we should follow these steps
+
 1) Use morphia
 ```Java
 		TransactionalDAO<UserEntity, DBObject> dao = TransactionalDAO.getInstance(UserEntity.class, getDatastore());
